@@ -84,7 +84,26 @@ export interface WorkPlan {
   outH: number;
   sar: [number, number]; // the output's pixel shape: the source's, or square when Upscale to resized it
   vf: string[]; // the decoder's downscale, empty = none
+  bicubic: boolean; // that downscale is bicubic (the shrink in front of RTX VSR or Anime4K), not Lanczos 7
   note: string;
+}
+
+/** Whether the shrink to a working size below the source is bicubic (Catmull-Rom, widened by the ratio) instead of
+ * Lanczos 7. Only in front of RTX VSR or Anime4K (`vsr` / `anime4k` = that upscaler is the one that will run), which
+ * rebuild a picture shrunk that way more closely: through the scale slider's shrink and back to 1080p (five clips at
+ * 1600x900 / 1280x720 / 960x540 / 640x360) RTX VSR measured +0.66 / +0.76 / +1.01 / +0.27 dB and Anime4K +0.07 /
+ * +0.52 / +0.63 / +0.63 dB against the Lanczos 7 shrink, RIFE's and GMFSS's generated frames +0.14 to +0.28 dB, a
+ * slow pan steadier; the Lanczos enlarge and ArtCNN lose with it, AMD FSR 4 and Intel XeSS-SR lose or gain at most
+ * 0.12 dB, Real-ESRGAN and AnimeJaNai HD gain at most 0.21 and 0.48 dB with the anime clip down at some sizes. And
+ * only on the chain that was measured: SDR in and out, nothing that repaints the picture
+ * (Restore, DLSS 5) between the shrink and the upscaler, and not DLSS 4.5 (`dlssg`), whose generated frames measured
+ * 0.03 to 0.21 dB lower behind this shrink (1280x720 and 960x540). SMV_SHRINK_BICUBIC=0 = Lanczos 7 always. */
+export function bicubicShrink(
+  o: { vsr: boolean; anime4k: boolean; hdr: boolean; restore: boolean; dlssnr: boolean; dlssg: boolean },
+  env: NodeJS.ProcessEnv,
+): boolean {
+  if (env.SMV_SHRINK_BICUBIC === '0' || o.hdr || o.restore || o.dlssnr || o.dlssg) return false;
+  return o.vsr || o.anime4k;
 }
 
 /** DLSS 5's GPU work never completes on a 64 px wide frame (the GPU resets; 102 and 128 px wide run, and so does a
@@ -103,7 +122,9 @@ export const DLSSG_MIN_WORK = 128;
  * output runs after the model; at most WORK_MAX_PX keeping the aspect; the share raised, aspect kept,
  * to the largest minimum of the pipeline: the shorter side 64 px, with DLSS 5 (nr) the width NR_MIN_WORK_W, with
  * DLSS 4.5 (dlssg) the shorter side DLSSG_MIN_WORK), and the decode (a working size below the source folds the
- * downscale into the decode, Lanczos at radius 7: the one shrink). A string = why --scale is refused. */
+ * downscale into the decode: the one shrink, Lanczos at radius 7, or bicubic when `bicubicUp` (bicubicShrink) and the
+ * output is larger than the working size on both axes, where the picked upscaler runs). A string = why --scale is
+ * refused. */
 export function workPlan(
   st: Stream,
   w: number,
@@ -112,6 +133,7 @@ export function workPlan(
   scale: string | null,
   nr = false,
   dlssg = false,
+  bicubicUp = false,
 ): WorkPlan | string {
   const srcSar = sourceSar(st);
   const [ow, oh] = outputSize(w, h, upscaleF, upscaleF !== 1.0, srcSar);
@@ -181,8 +203,10 @@ export function workPlan(
   }
   let vf: string[] = [];
   let [dw, dh] = [w, h];
+  let bicubic = false;
   if (ww < w || wh < h) {
-    vf = dscaleVf(st, w, h, ww, wh);
+    bicubic = bicubicUp && ow > ww && oh > wh;
+    vf = dscaleVf(st, w, h, ww, wh, bicubic);
     [dw, dh] = [ww, wh];
   }
   const note =
@@ -192,10 +216,13 @@ export function workPlan(
       : '') +
     (atSource ? ', capped at the source: the enlarge runs after the model' : '') +
     (atFloor ? ", raised to a model's minimum size: the one enlarge before the model" : '') +
-    (vf.length ? ', the downscale folded into the decode, Lanczos at radius 7' : '') +
+    (vf.length
+      ? ', the downscale folded into the decode, ' +
+        (bicubic ? 'bicubic (Catmull-Rom) in front of the upscaler' : 'Lanczos at radius 7')
+      : '') +
     (capped ? "; capped at 3840x2160, the interpolation's reach" : '') +
     ')\n';
-  return { w: dw, h: dh, workW: ww, workH: wh, outW: ow, outH: oh, sar, vf, note };
+  return { w: dw, h: dh, workW: ww, workH: wh, outW: ow, outH: oh, sar, vf, bicubic, note };
 }
 
 /** The output resolution: the factor on both dimensions, each rounded down to even; the width also takes the source's

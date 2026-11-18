@@ -1,8 +1,8 @@
 diff --git a/dxil_converter.cpp b/dxil_converter.cpp
-index 26e858a3..1a42e42c 100644
+index 562d8b1c..9b04f3b1 100644
 --- a/dxil_converter.cpp
 +++ b/dxil_converter.cpp
-@@ -10026,6 +10026,7 @@ void Converter::Impl::set_option(const OptionBase &cap)
+@@ -10030,6 +10030,7 @@ void Converter::Impl::set_option(const OptionBase &cap)
  		auto &float8 = static_cast<const OptionFloat8Support &>(cap);
  		options.wmma_fp8 = float8.wmma_fp8;
  		options.nv_cooperative_matrix2_conversions = float8.nv_cooperative_matrix2_conversions;
@@ -10,7 +10,7 @@ index 26e858a3..1a42e42c 100644
  		break;
  	}
  
-@@ -10194,15 +10195,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
+@@ -10198,15 +10199,29 @@ const GlobalConfiguration &GlobalConfiguration::get()
  	return config;
  }
  
@@ -111,7 +111,7 @@ index 5f4de3e9..f3c13051 100644
  
  typedef struct dxil_spv_option_nvapi
 diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
-index 0da1d9e0..5961e2f7 100644
+index 9ecaa7fd..56f42745 100644
 --- a/opcodes/converter_impl.hpp
 +++ b/opcodes/converter_impl.hpp
 @@ -171,6 +171,8 @@ public:
@@ -123,7 +123,7 @@ index 0da1d9e0..5961e2f7 100644
  	bool simulate_min16float_min_spec = false;
  	bool experimental_unstructured_control_flow = false;
  
-@@ -816,6 +818,7 @@ struct Converter::Impl
+@@ -815,6 +817,7 @@ struct Converter::Impl
  		bool nv_raw_access_chains = false;
  		bool wmma_fp8 = false;
  		bool nv_cooperative_matrix2_conversions = false;
@@ -977,7 +977,7 @@ index c8742a9d..8120e877 100644
  	void reset()
  	{
 diff --git a/third_party/glslang-spirv/SpvBuilder.cpp b/third_party/glslang-spirv/SpvBuilder.cpp
-index abd5aacb..792154f4 100644
+index 2860bda7..5603fcf8 100644
 --- a/third_party/glslang-spirv/SpvBuilder.cpp
 +++ b/third_party/glslang-spirv/SpvBuilder.cpp
 @@ -391,6 +391,21 @@ Id Builder::makeFloatType(int width, int encoding)
@@ -1003,7 +1003,7 @@ index abd5aacb..792154f4 100644
  {
  	Instruction* type;
 diff --git a/third_party/glslang-spirv/SpvBuilder.h b/third_party/glslang-spirv/SpvBuilder.h
-index 25d4a0bf..a61b8885 100755
+index 2b8ea372..58af00d9 100755
 --- a/third_party/glslang-spirv/SpvBuilder.h
 +++ b/third_party/glslang-spirv/SpvBuilder.h
 @@ -128,6 +128,7 @@ public:

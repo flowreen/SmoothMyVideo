@@ -109,6 +109,7 @@ function prevSettingsSig() {
     nrPasses(),
     nrMaskOn(),
     dlssMode(),
+    cmpA() === 'dlssg', // DLSS 4.5 keeps the Lanczos shrink in front of RTX VSR / Anime4K
   ];
 }
 let lastPrevInput = null; // which video the shown original belongs to
@@ -162,6 +163,7 @@ async function loadPreview(frame, bg?) {
         {
           input,
           frame: frame == null ? 'mid' : frame,
+          model: cmpA(),
           sharpen,
           restore: restoreOn(),
           restoreModel: restoreModelId(),

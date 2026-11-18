@@ -42,6 +42,7 @@ type PreviewOpts = {
   nrstyle?: number; // DLSS 5 Style 0 Default / 1 Natural / 2 Cinematic
   nrpasses?: number; // DLSS 5 passes 1..20
   nrmask?: boolean;
+  model?: string; // the Video tab's interpolation model ('' = none): the render's shrink depends on it
 };
 
 // render/preview.js's command line for the current settings, writing its PNGs under `prefix`
@@ -115,6 +116,7 @@ ipcMain.handle('preview', (_e, opts: PreviewOpts) => {
   return new Promise((resolve) => {
     const prefix = previewPrefix('frame');
     const args = previewArgv(opts, prefix);
+    if (opts.model) args.push('--model-a', opts.model);
     // like the render: Electron's own node runs the compiled module
     const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', SMV_ENGINE_DIR: ENGINE };
     execFile(process.execPath, args, { cwd: ENGINE, env, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {

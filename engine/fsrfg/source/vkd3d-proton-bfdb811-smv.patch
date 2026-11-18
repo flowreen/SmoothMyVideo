@@ -88,7 +88,7 @@ index 02beb74d..8834e393 100644
              {
                  static const dxil_spv_option_extended_non_semantic non_semantic = {
 diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
-index b4d0976b..5317fbc1 100644
+index b1941888..8e96141c 100644
 --- a/libs/vkd3d/command.c
 +++ b/libs/vkd3d/command.c
 @@ -394,26 +394,32 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device, VkSemaphore vk_se
@@ -282,7 +282,7 @@ index b4d0976b..5317fbc1 100644
      TRACE("iface %p, gpu_handle %#"PRIx64", cpu_handle %zx, resource %p, values %p, rect_count %u, rects %p.\n",
              iface, gpu_handle.ptr, cpu_handle.ptr, resource, values, rect_count, rects);
  
-@@ -23019,6 +23086,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_ifac
+@@ -23026,6 +23093,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_ifac
  
      TRACE("iface %p, NumBarrierGroups %u, D3D12_BARRIER_GROUP %p\n",
              iface, NumBarrierGroups, pBarrierGroups);
@@ -306,10 +306,10 @@ index 8fabb245..588d2335 100644
      win32_handle_info.pNext = NULL;
      win32_handle_info.semaphore = fence->timeline_semaphore;
 diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
-index b580de5b..69952ff9 100644
+index 3139d6dd..7e62067c 100644
 --- a/libs/vkd3d/device.c
 +++ b/libs/vkd3d/device.c
-@@ -2438,9 +2438,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
+@@ -2446,9 +2446,19 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
                  break;
  
              default:
@@ -329,7 +329,7 @@ index b580de5b..69952ff9 100644
          }
      }
  
-@@ -2659,6 +2669,16 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
+@@ -2667,6 +2677,16 @@ static HRESULT vkd3d_init_device_caps(struct d3d12_device *device,
  
      if (physical_device_info->cooperative_matrix_features.cooperativeMatrix)
      {
@@ -346,7 +346,7 @@ index b580de5b..69952ff9 100644
          if (!vkd3d_supports_minimum_coopmat_caps(device))
          {
              physical_device_info->cooperative_matrix_features.cooperativeMatrix = VK_FALSE;
-@@ -6746,12 +6766,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+@@ -6754,12 +6774,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
              return DXGI_ERROR_INVALID_CALL;
          }
  
@@ -361,7 +361,7 @@ index b580de5b..69952ff9 100644
          if (attributes)
              FIXME("attributes %p not handled.\n", attributes);
          if (access)
-@@ -6833,7 +6849,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
+@@ -6841,7 +6857,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateSharedHandle(d3d12_device_if
          win32_handle_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
          win32_handle_info.pNext = NULL;
          win32_handle_info.semaphore = fence->timeline_semaphore;
@@ -371,7 +371,7 @@ index b580de5b..69952ff9 100644
  
          vr = VK_CALL(vkGetSemaphoreWin32HandleKHR(device->vk_device, &win32_handle_info, handle));
  
-@@ -10266,10 +10283,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
+@@ -10279,10 +10296,27 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
                  VKD3D_SHADER_TARGET_EXTENSION_WMMA_FP8;
      }
  
@@ -442,10 +442,10 @@ index 39e4b0b6..8d98b93e 100644
          bind_info.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
          bind_info.pNext = NULL;
 diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
-index b0ebd552..08f7afe9 100644
+index e63dc7b7..e81069e4 100644
 --- a/libs/vkd3d/vkd3d_private.h
 +++ b/libs/vkd3d/vkd3d_private.h
-@@ -342,6 +342,7 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device,
+@@ -343,6 +343,7 @@ void vkd3d_add_wait_to_all_queues(struct d3d12_device *device,
          VkSemaphore vk_semaphore, uint64_t value);
  HRESULT vkd3d_create_timeline_semaphore(struct d3d12_device *device,
          uint64_t initial_value, bool shared, VkSemaphore *vk_semaphore);
@@ -453,7 +453,7 @@ index b0ebd552..08f7afe9 100644
  HRESULT vkd3d_enqueue_timeline_semaphore(struct vkd3d_fence_worker *worker,
          const struct vkd3d_fence_wait_info *fence_info,
          const struct vkd3d_queue_timeline_trace_cookie *timeline_cookie);
-@@ -3439,6 +3440,9 @@ struct d3d12_command_list
+@@ -3447,6 +3448,9 @@ struct d3d12_command_list
  
      D3D12_COMMAND_LIST_TYPE type;
      VkQueueFlags vk_queue_flags;

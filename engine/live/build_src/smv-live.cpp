@@ -1850,6 +1850,7 @@ struct OfflineArgs
     std::wstring cacheW;               // --cache DIR: the kernel cubin folder when no jit path names one
     int outW = 0, outH = 0;            // --out-w / --out-h: the output size, 0 = w x h
     int workW = 0, workH = 0;          // --work-w / --work-h: the working size (the DLSS mode x the output), 0 = none
+    int shrunkW = 0, shrunkH = 0;      // --shrunk-from-w / -h: the source size the decode shrank the frames from
     bool outX2 = false;                // --out-pixfmt x2rgb10le: the RTX HDR encode pipe (needs --rtx-hdr)
     std::wstring hdrStatsW;            // --hdr-stats PATH: the light statistics JSON the render reads at the finalize
     bool hdrDv = false, hdrHp = false; // --hdr-dv / --hdr-hp: add the DV L1 / HDR10+ per-frame records
@@ -1982,6 +1983,10 @@ static int parseOfflineArgs(int argc, wchar_t** argv, int first, OfflineArgs& oa
             oa.workW = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--work-h") == 0 && i + 1 < argc)
             oa.workH = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--shrunk-from-w") == 0 && i + 1 < argc)
+            oa.shrunkW = _wtoi(argv[++i]);
+        else if (wcscmp(argv[i], L"--shrunk-from-h") == 0 && i + 1 < argc)
+            oa.shrunkH = _wtoi(argv[++i]);
         else if (wcscmp(argv[i], L"--no-gpu-fit") == 0)
             g_noGpuFit = true;
         else if (wcscmp(argv[i], L"--sharpen") == 0 && i + 1 < argc)
@@ -2490,6 +2495,10 @@ static int runOfflineSession(const OfflineArgs& oa, HANDLE hIn, HANDLE hOut, boo
         return 2;
     }
     if (!nativeBuildKernels(nr, cacheDir))
+        return 2;
+    // the decoded frames came from the decode's shrink of the source (the render names its size), the emit's final
+    // resize may enlarge them back
+    if (!nativeLzSession(nr, oa.shrunkW, oa.shrunkH, srcW, srcH))
         return 2;
     const size_t plane = (size_t)nr.ph * nr.pw;
     const bool outIs16 = out16 < 0 ? fmt16 : (out16 == 1);

@@ -968,6 +968,7 @@ static bool nativeBindKernels(NativeRife& nr)
         {&nr.fFsrHdrOut, "k_fsrHdrOut"},
         {&nr.fFsrHdrPack, "k_fsrHdrPack"},
         {&nr.fRsTab, "k_rsTab"},
+        {&nr.fRsTabBc, "k_rsTabBc"},
         {&nr.fPackOutV, "k_packOutV"},
         {&nr.fPackOutHdrV, "k_packOutHdrV"},
         {&nr.fRestIn, "k_restIn"},
@@ -1081,34 +1082,214 @@ static void nativeFail(NativeRife& nr, const char* why)
         nr.die(why);
 }
 
-// one resize axis's tap table (in -> out: lzTaps x out entries of 8 bytes), built by k_rsTab on the reader's stream at
-// its first use (so it is ready before that read) and kept for the session; nullptr = the allocation or the launch failed
-static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st)
+// the matched enlarge: the picture model's neighbour correlation and each working sample's noise (the least-squares
+// solve below; the values the resize study measured at)
+static const double kLzMatchRho = 0.97, kLzMatchEps = 1e-4;
+
+// does the enlarge in -> out take the matched table: it goes back to the size one of the session's shrinks came from
+static bool lzMatched(const NativeRife& nr, int in, int out)
 {
+    for (int a = 0; a < 2; a++)
+        if (in < out && nr.lzShrunk[a][0] == out && nr.lzShrunk[a][1] == in)
+            return true;
+    return false;
+}
+
+// the matched enlarge's table, in -> out, for frames the kLzDown Lanczos shrank from out to in (k_rsTab's layout:
+// {float w, int i} at k * out + o): each output position's 2 kLzUpShrunk weights on the working samples around it are
+// the ones that rebuild the full-size sample best in the least-squares sense, for a picture whose full-size samples
+// correlate by kLzMatchRho ^ distance pushed through that shrink, kLzMatchEps of noise on every working sample: one
+// Cholesky solve per position, in double, the weights normalised to sum 1, the window kept inside the axis at its
+// edges (no mirrored taps). The shrink's own rows are k_rsTab's arithmetic (zimg's placement, mirrored edges,
+// normalised), in double. false = the axis is shorter than the window.
+static bool lzMatchedTab(int in, int out, std::vector<uint8_t>& tab)
+{
+    const int K = 2 * kLzUpShrunk;
+    if (in < K || out <= in)
+        return false;
+    const int fd = 2 * (int)(((long long)kLzDown * out + in - 1) / in);
+    std::vector<int> js((size_t)in * fd);
+    std::vector<double> ws((size_t)in * fd);
+    const double pi = 3.14159265358979323846, a = (double)kLzDown;
+    for (int s = 0; s < in; s++)
+    {
+        const long long num = (2LL * s + 1) * out - (long long)(fd - 1) * in, den = 2LL * in;
+        long long q = num / den;
+        if (num - q * den < 0)
+            q--;
+        double sum = 0.0;
+        for (int k = 0; k < fd; k++)
+        {
+            const long long j = q + k;
+            const double x = fabs((double)((2 * j + 1) * in - (2LL * s + 1) * out) / (2.0 * out));
+            const double w = x >= a ? 0.0 : (x == 0.0 ? 1.0 : a * sin(pi * x) * sin(pi * x / a) / (pi * x * pi * x));
+            long long m = j < 0 ? -j - 1 : j;
+            if (m >= out)
+                m = 2LL * out - m - 1;
+            js[(size_t)s * fd + k] = (int)(m < 0 ? 0 : (m >= out ? out - 1 : m));
+            ws[(size_t)s * fd + k] = w;
+            sum += w;
+        }
+        for (int k = 0; k < fd; k++)
+            ws[(size_t)s * fd + k] /= sum;
+    }
+    std::vector<double> rp((size_t)out + 1);
+    rp[0] = 1.0;
+    for (int d = 1; d <= out; d++)
+        rp[d] = rp[d - 1] * kLzMatchRho;
+    // the working samples' covariance within the window's reach: css[s K + d] = cov(s, s + d)
+    std::vector<double> css((size_t)in * K, 0.0);
+    for (int s = 0; s < in; s++)
+        for (int d = 0; d < K && s + d < in; d++)
+        {
+            const int s2 = s + d;
+            double c = 0.0;
+            for (int k = 0; k < fd; k++)
+                for (int l = 0; l < fd; l++)
+                    c += ws[(size_t)s * fd + k] * ws[(size_t)s2 * fd + l] *
+                         rp[abs(js[(size_t)s * fd + k] - js[(size_t)s2 * fd + l])];
+            css[(size_t)s * K + d] = c + (d == 0 ? kLzMatchEps : 0.0);
+        }
+    tab.assign((size_t)K * out * 8, 0);
+    std::vector<double> A((size_t)K * K), b(K);
+    for (int o = 0; o < out; o++)
+    {
+        const long long num = (2LL * o + 1) * in - out, den = 2LL * out;
+        long long c0 = num / den;
+        if (num - c0 * den < 0)
+            c0--;
+        long long st = c0 - K / 2 + 1;
+        st = st < 0 ? 0 : (st > in - K ? in - K : st);
+        for (int r = 0; r < K; r++)
+        {
+            for (int c = 0; c < K; c++)
+            {
+                const int lo = r < c ? r : c;
+                A[(size_t)r * K + c] = css[(size_t)(st + lo) * K + abs(r - c)];
+            }
+            double v = 0.0;
+            const size_t s = (size_t)(st + r);
+            for (int k = 0; k < fd; k++)
+                v += ws[s * fd + k] * rp[abs(js[s * fd + k] - o)];
+            b[r] = v;
+        }
+        // Cholesky A = L L^T in place (lower triangle), then L y = b, L^T w = y
+        for (int j = 0; j < K; j++)
+        {
+            double d = A[(size_t)j * K + j];
+            for (int k = 0; k < j; k++)
+                d -= A[(size_t)j * K + k] * A[(size_t)j * K + k];
+            if (d <= 0.0)
+                return false;
+            d = sqrt(d);
+            A[(size_t)j * K + j] = d;
+            for (int i = j + 1; i < K; i++)
+            {
+                double v = A[(size_t)i * K + j];
+                for (int k = 0; k < j; k++)
+                    v -= A[(size_t)i * K + k] * A[(size_t)j * K + k];
+                A[(size_t)i * K + j] = v / d;
+            }
+        }
+        for (int i = 0; i < K; i++)
+        {
+            double v = b[i];
+            for (int k = 0; k < i; k++)
+                v -= A[(size_t)i * K + k] * b[k];
+            b[i] = v / A[(size_t)i * K + i];
+        }
+        for (int i = K - 1; i >= 0; i--)
+        {
+            double v = b[i];
+            for (int k = i + 1; k < K; k++)
+                v -= A[(size_t)k * K + i] * b[k];
+            b[i] = v / A[(size_t)i * K + i];
+        }
+        double sum = 0.0;
+        for (int k = 0; k < K; k++)
+            sum += b[k];
+        for (int k = 0; k < K; k++)
+        {
+            const float w = (float)(b[k] / sum);
+            const int j = (int)st + k;
+            uint8_t* e = tab.data() + ((size_t)k * out + o) * 8;
+            memcpy(e, &w, 4);
+            memcpy(e + 4, &j, 4);
+        }
+    }
+    return true;
+}
+
+// Live: the capture's shrink to the working size is bicubic (k_rsTabBc) while RTX VSR or Anime4K is the upscaler that
+// enlarges the frames after the model. Both rebuild a picture shrunk that way more closely than one the Lanczos
+// shrank: through the scale slider's shrink and back to 1080p (five clips at 1600x900 / 1280x720 / 960x540 / 640x360)
+// RTX VSR +0.66 / +0.76 / +1.01 / +0.27 dB, Anime4K +0.07 / +0.52 / +0.63 / +0.63 dB, RIFE's and GMFSS's generated
+// frames +0.14 to +0.28 dB, a slow pan steadier; the Lanczos enlarge loses 0.5 to 2.0 dB behind it, the other
+// upscalers gain under 0.5 dB or lose. Only on the chain that was measured: an SDR session, nothing that repaints the
+// picture between the shrink and the upscaler (RTX HDR, DLSS 5; Restore folds the capture itself), and not DLSS 4.5,
+// whose generated frames measured 0.03 to 0.21 dB lower behind this shrink. Read at every captured frame, so the
+// shrink follows an upscaler switched, warming or failed in a running session. SMV_SHRINK_BICUBIC=0 = the Lanczos
+// always.
+static bool nativeShrinkBc(const NativeRife& nr)
+{
+    static const bool off = lkEnv("SMV_SHRINK_BICUBIC") == "0";
+    if (off || g_offline || g_backend == BK_DLSSG || g_fgOver || nr.hdr || nr.rtxHdr || (nr.nrHost && !nr.nrPaused))
+        return false;
+    return nr.vsr && !nr.vsrFailed && !nr.fsrUp && !nr.acnUp && !nr.rgUp;
+}
+
+// one resize axis's tap table (in -> out: lzTaps x out entries of 8 bytes), built by k_rsTab on the reader's stream at
+// its first use (so it is ready before that read) and kept for the session, or the matched table (lzMatched) solved on
+// the CPU and copied in on that stream; bc on a shrinking axis = the bicubic shrink's table (k_rsTabBc) instead;
+// nullptr = the allocation, the solve, the copy or the launch failed
+static const void* rsTabFor(NativeRife& nr, int in, int out, cudaStream_t st, bool bc = false)
+{
+    bc = bc && in > out;
     std::vector<NativeRife::RsTab>& tabs = t_puTabs ? nr.puRsTabs : nr.rsTabs;
     for (const NativeRife::RsTab& e : tabs)
-        if (e.in == in && e.out == out)
+        if (e.in == in && e.out == out && e.bc == bc)
             return e.d;
     void* d = nullptr;
     if (cudaMalloc(&d, (size_t)lzTaps(in, out) * out * 8) != cudaSuccess)
         return nullptr;
+    if (lzMatched(nr, in, out))
+    {
+        std::vector<uint8_t> t;
+        // a pageable source: the copy has left it once the call returns
+        if (!lzMatchedTab(in, out, t) || t.size() != (size_t)lzTaps(in, out) * out * 8 ||
+            cudaMemcpyAsync(d, t.data(), t.size(), cudaMemcpyHostToDevice, st) != cudaSuccess)
+        {
+            cudaFree(d);
+            return nullptr;
+        }
+        tabs.push_back({in, out, d, false});
+        return d;
+    }
     void* a[] = {&in, &out, &d};
-    if (cuLaunchKernel(nr.fRsTab, (out + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) != CUDA_SUCCESS)
+    if (cuLaunchKernel(bc ? nr.fRsTabBc : nr.fRsTab, (out + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream)st, a, nullptr) !=
+        CUDA_SUCCESS)
     {
         cudaFree(d);
         return nullptr;
     }
-    tabs.push_back({in, out, d});
+    if (bc)
+        LOG("native: the capture's shrink %d -> %d is bicubic (Catmull-Rom): RTX VSR or Anime4K enlarges after it "
+            "(SMV_SHRINK_BICUBIC=0 = Lanczos %d)\n",
+            in, out, kLzDown);
+    tabs.push_back({in, out, d, bc});
     return d;
 }
 
 // one resize axis's tap table on the CPU (the session's final DLSS 4.5 enlarge, Host::lzTabFn): k_rsTab on a stream
 // and into a buffer of its own (the compute thread's tables and streams stay untouched) once the native pipeline is
-// up = 1; else k_rsTab's arithmetic ported (sin in double rounded once where the kernel has sinpif) = 2
+// up = 1; else k_rsTab's arithmetic ported (sin in double rounded once where the kernel has sinpif) = 2; the matched
+// table (lzMatched) = 3
 static int nativeRsTabHost(NativeRife* nrp, int in, int out, std::vector<uint8_t>& tab)
 {
     if (in <= 0 || out <= 0)
         return 0;
+    if (nrp && lzMatched(*nrp, in, out))
+        return lzMatchedTab(in, out, tab) ? 3 : 0;
     const size_t bytes = (size_t)lzTaps(in, out) * out * 8;
     bool up = false;
     if (nrp)
@@ -1141,7 +1322,7 @@ static int nativeRsTabHost(NativeRife* nrp, int in, int out, std::vector<uint8_t
         if (ok)
             return 1;
     }
-    const int fs = lzTaps(in, out), a = in > out ? kLzDown : kLzUp;
+    const int fs = lzTaps(in, out), a = in > out ? kLzDown : g_lzUp;
     auto arg = [&](int j, int o) {
         const long long n = (2LL * j + 1) * out - (2LL * o + 1) * in, d = 2LL * (in >= out ? in : out);
         const long long q = n / d;
@@ -1184,6 +1365,41 @@ static int nativeRsTabHost(NativeRife* nrp, int in, int out, std::vector<uint8_t
         }
     }
     return 2;
+}
+
+// the session's enlarge, once the module is built and the frames' sizes are known, before any table or resize: frames
+// the session itself shrank on either axis (from > to: Live's capture to the working size, a file render's decode-side
+// shrink named by --shrunk-from-w / -h) read 2 kLzUpShrunk taps on every enlarge, the matched table on an enlarge back
+// to the size they came from (rsTabFor / nativeRsTabHost), else 2 kLzUp; SMV_LZ_MATCHED=0 = kLzUp always. Sets the
+// kernel text's c_lzUp and the host's g_lzUp together (every session, so a resident host never keeps the last one's).
+static bool nativeLzSession(NativeRife& nr, int fromW, int fromH, int toW, int toH)
+{
+    static const bool off = lkEnv("SMV_LZ_MATCHED") == "0";
+    const int from[2] = {fromW, fromH}, to[2] = {toW, toH};
+    bool shrunk = false;
+    for (int a = 0; a < 2; a++)
+    {
+        const bool s = !off && from[a] > to[a] && to[a] > 0;
+        nr.lzShrunk[a][0] = s ? from[a] : 0;
+        nr.lzShrunk[a][1] = s ? to[a] : 0;
+        shrunk = shrunk || s;
+    }
+    const int up = shrunk ? kLzUpShrunk : kLzUp;
+    CUdeviceptr p = 0;
+    size_t n = 0;
+    if (cuModuleGetGlobal(&p, &n, nr.cuMod, "c_lzUp") != CUDA_SUCCESS || n != sizeof(int) ||
+        cuMemcpyHtoDAsync(p, &up, sizeof(int), (CUstream)nr.stream) != CUDA_SUCCESS ||
+        cudaStreamSynchronize(nr.stream) != cudaSuccess)
+    {
+        LOG("native: the session's enlarge radius could not be set\n");
+        return false;
+    }
+    g_lzUp = up;
+    if (shrunk)
+        LOG("native: enlarge after the session's own shrink (%dx%d -> %dx%d): %d taps an axis, solved to undo the "
+            "shrink on an enlarge back to %dx%d, else Lanczos %d (SMV_LZ_MATCHED=0 = Lanczos %d)\n",
+            fromW, fromH, toW, toH, 2 * up, fromW, fromH, up, kLzUp);
+    return true;
 }
 
 // SMV_NATIVE_ARCH=75 (a test lever): every module compiled as compute_75 PTX, which the driver JIT-compiles for the

@@ -812,7 +812,10 @@ float4 psV(float4 pos : SV_Position) : SV_Target
         if (!waitQueue())
             return false;
         LOG("DLSS 4.5's final enlarge: %ux%u -> %ux%u by the native fit's Lanczos, %u / %u taps (%s)\n", W, H, winW,
-            winH, lzFsH, lzFsV, kh == 1 && kv == 1 ? "the native k_rsTab tables" : "the tables' CPU port");
+            winH, lzFsH, lzFsV,
+            kh == 3 || kv == 3   ? "solved to undo the capture's shrink"
+            : kh == 1 && kv == 1 ? "the native k_rsTab tables"
+                                 : "the tables' CPU port");
         lzReady = true;
         return true;
     }

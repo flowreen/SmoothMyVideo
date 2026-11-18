@@ -131,8 +131,8 @@ third-party work.
   > SOFTWARE.
 * **vkd3d-proton** (D3D12 on Vulkan: it runs AMD's FSR 4 frame generation on NVIDIA GPUs):
   `engine/fsrfg/smv_vkd3d_d3d12.dll` and `engine/fsrfg/smv_vkd3d_d3d12core.dll`, built from vkd3d-proton
-  (github.com/HansKristian-Work/vkd3d-proton) commit 5b1089c89dbc5cb9f662650feb60d2d3df3e55ca with its dxil-spirv at
-  114e664efca411c926380b2f3bd1930c1faeaf4d, both modified: the patches ship beside the DLLs in `engine/fsrfg/source/`,
+  (github.com/HansKristian-Work/vkd3d-proton) commit bfdb811c6d7ccd8c6151f19532654b063a6631f2 with its dxil-spirv at
+  a781dce9b5f2dd076f419d7f98dcc2dcf5f011d5, both modified: the patches ship beside the DLLs in `engine/fsrfg/source/`,
   the build steps are in `engine/fsrfg/build_src/build.bat`. GNU Lesser General Public License 2.1 (vkd3d-proton's
   COPYING, LICENSE and AUTHORS in `engine/fsrfg/licenses/`); the app loads the two DLLs at run time, so a rebuild from
   the corresponding source replaces them. Built into them, with their notices in `engine/fsrfg/licenses/`: dxil-spirv

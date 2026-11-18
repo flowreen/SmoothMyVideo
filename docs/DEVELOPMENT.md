@@ -547,7 +547,8 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   output` (`, capped at the source: the enlarge runs after the model` when the source capped it). Live's working
   size is the same share of the presented rect capped at the captured size (Fill on a smaller window: the
   window's own size is the DLAA size). A working size below the source folds the downscale into
-  the decode (`zscale` Lanczos at radius 7 on the decoded RGB, in the source's own transfer: through
+  the decode (`zscale` Lanczos at radius 7, or bicubic in front of RTX VSR or Anime4K, see below, on the decoded RGB,
+  in the source's own transfer: through
   SMV's enlarge back it measured 1.5 to 1.7 dB above the same shrink in linear light at radius 3, 4 or 6
   on average, and above linear Lanczos3 on every one of the universal test's 44 cells); otherwise the
   host gets `--work-w W --work-h H` (sent
@@ -562,7 +563,37 @@ the SDR range, resized on the codes`; `SMV_HDR_RESIZE_VIEW=0` resizes every fram
   where it shrinks (`kLzUp` / `kLzDown` in the kernel text: the universal resizer test's picks, the best no-sharpen
   PSNR over anime, real camera and CGI, +0.06 dB up and +0.30 dB down against Lanczos3; down, each radius up to 7
   beat the one before on every measured cell and 8 was the first to lose one), the same kernel as the decode-side
-  shrink.
+  shrink. A session whose frames come from its own shrink (Live's capture to a working size below it; a file render
+  whose decode shrank the source, `--shrunk-from-w W --shrunk-from-h H` naming the source's size) enlarges with 16
+  taps an axis instead (`kLzUpShrunk`): an enlarge back to the size the frames were shrunk from takes weights solved
+  to undo that Lanczos 7 shrink (`lzMatchedTab`: per output position the 16 working samples around it, least squares
+  for a picture whose neighbouring samples correlate by 0.97 a pixel, solved once per size pair on the CPU), any
+  other enlarge in that session Lanczos at radius 8. Through the scale slider's shrink and back (no model, the
+  universal test's 11 clips at 1600x900 / 1280x720 / 960x540 / 640x360 to 1080p) it measured +0.55 dB against the
+  radius-4 enlarge, every cell up, RIFE's tweens within -0.02 to +0.04 dB; a plain enlarge of a compressed source
+  keeps radius 4 (radius 8 there fell 0.05 dB or more under it on 4 of the 44 cells). The log line =
+  `native: enlarge after the session's own shrink (WxH -> WxH): 16 taps an axis, ...`; `SMV_LZ_MATCHED=0` = radius 4
+  everywhere. In front of RTX VSR or Anime4K that shrink is bicubic instead: Catmull-Rom (the cubic at b 0, c 0.5),
+  widened by the ratio and placed like the Lanczos (the decode's `zscale` `filter=bicubic:param_a=0:param_b=0.5`;
+  Live's `k_rsTabBc` table, read by the same resize kernels; `plan.ts` `bicubicShrink`, the host's
+  `nativeShrinkBc`). Both upscalers rebuild a picture shrunk that way more closely: through the scale slider's shrink
+  and back to 1080p (five clips of 12 frames at 1600x900 / 1280x720 / 960x540 / 640x360) RTX VSR measured +0.66 /
+  +0.76 / +1.01 / +0.27 dB and Anime4K +0.07 / +0.52 / +0.63 / +0.63 dB against the Lanczos 7 shrink, RIFE's and
+  GMFSS's generated frames +0.14 to +0.28 dB (36 triplets against the true middle frame, 1280x720 and 960x540), and a
+  slow pan through either upscaler is steadier (the spread of a frame over a 1 px a frame pan x0.89 to x0.94 with RTX
+  VSR, x0.81 to x0.97 with Anime4K). The Lanczos enlarge loses 0.5 to 2.0 dB behind it and ArtCNN up to 0.6 dB, AMD
+  FSR 4 and Intel XeSS-SR lose or gain at most 0.12 dB, Real-ESRGAN and AnimeJaNai HD gain at most 0.21 and 0.48 dB
+  with the anime clip down at some sizes: those keep the Lanczos. It runs only on the chain that was measured: SDR in
+  and out (no HDR source or desktop, no RTX HDR), no Restore and no DLSS 5 between the shrink and the upscaler, the
+  upscaler running (a file render: an output larger than the working size on both axes and, for RTX VSR, its files
+  present; Live asks at every captured frame, so the shrink follows an upscaler switched, warming or failed), and not
+  with DLSS 4.5, whose generated frames measured 0.03 to 0.21 dB lower behind it while its real frames gain like the
+  others'. A file render with the bicubic shrink sends no `--shrunk-from-w / -h`: its way back is the upscaler, and
+  the solved enlarge fits the Lanczos shrink only. The preview takes the Video tab's model (`--model-a`) for the same
+  choice; a compare runs both its models on the frames the first one's render decodes. The plan's line names the
+  shrink (`..., the downscale folded into the decode, bicubic (Catmull-Rom) in front of the upscaler`), Live logs
+  `native: the capture's shrink N -> M is bicubic (Catmull-Rom): ...` once per axis; `SMV_SHRINK_BICUBIC=0` = the
+  Lanczos always.
 * `--restore`: Real-ESRGAN anime-video model once per source frame, first (a generative repaint;
   cleans compression noise, can flatten fine texture), folded straight to the working size, or
   back to the source size when RTX VSR runs the resize after it. The bundled model runs on the host's own CUDA
@@ -1439,7 +1470,8 @@ per-frame passes run in the exe
 too (`nativeOfflineEmit` on every output frame: the resize, RTX VSR or clamped Lanczos,
 only ever an enlarge since a downscale folds into the decode, then to_bytes' quantisation; Restore,
 DLSS 5, Sharpen and RTX HDR run before the model, see Passes above): `native.ts` passes `--out-w --out-h --rtx-vsr --sharpen S
---restore` and loads none of those passes itself, the host runs the bundled Restore on its own kernels (a
+--restore` (and `--shrunk-from-w --shrunk-from-h` with the source's size when the decode's Lanczos shrank it, to the
+pass that enlarges) and loads none of those passes itself, the host runs the bundled Restore on its own kernels (a
 `--restore-model` graph: its engine, built when it is missing). RTX HDR runs there too: TrueHDR once per decoded frame at the working
 size after DLSS 5 and Sharpen (`nativePreModelPost`, the vivid / rtx / raw colour modes and Dynamic
 Vibrance with live's kernel math), the model interpolates the PQ frames, and the emit writes the
@@ -1785,10 +1817,13 @@ input, `nativePreModelPost`; on HDR planes through their SDR view, see `--sharpe
 on the `native host ready` line; the resize kernels are checked against an fp64 port of zimg's Lanczos placement
 at the text's radii and against zimg
 itself: within 0.05 codes at 16 bits, the same bytes at two block shapes. Every resize of a planar frame runs as the Lanczos pair
-`k_fitAaH` / `k_fitAaV` at every ratio (support `kLzDown` x the ratio on a shrinking axis, `2 kLzUp` taps on an
-enlarging one, window maths exact in integers, since the window start and every tap argument are ratios of the
+`k_fitAaH` / `k_fitAaV` at every ratio (support `kLzDown` x the ratio on a shrinking axis, `2 c_lzUp` taps on an
+enlarging one: the session's radius, `kLzUp`, or `kLzUpShrunk` after its own shrink, set by `nativeLzSession`; window
+maths exact in integers, since the window start and every tap argument are ratios of the
 frame sizes; each axis reads its taps from one table per resize, `in -> out`, in global memory: `k_rsTab` builds it
-on the reader's stream at its first use and `rsTabFor` keeps it for the session, every ratio fits, a failed table =
+on the reader's stream at its first use (an enlarge back to a shrink's source size: `lzMatchedTab` on the CPU, copied
+in on that stream; Live's capture shrink in front of RTX VSR or Anime4K: `k_rsTabBc`, Catmull-Rom in the same window
+and layout, zeros beyond its reach) and `rsTabFor` keeps it for the session, one per axis and kernel, every ratio fits, a failed table =
 `native: the resize tap tables for WxH -> WxH failed` and the resize refuses): the live fit (a window larger than the monitor in Fill screen, a
 DLSS mode below DLAA) with its vertical pass fused with the slot store (`k_packOutV` / `k_packOutHdrV`), Upscale
 to's resizes, the resize before the model, an HDR frame's SDR-view fit, Restore's HDR reference and the motion
@@ -2031,6 +2066,8 @@ named here, and on a name here that no source holds.
 | `SMV_GM_SPLAT=old` | GMFSS's splats by the scatter kernels (k_splatSoft + k_splatNorm) instead of the gather ones (A/B; the same output) |
 | `SMV_GM_LCORR=old` | GMFlow's local correlation by the warp-a-pixel kernel (k_localCorr, exact fp32 dot sums) instead of its tensor-core form (k_localCorrT); A/B: the outputs differ in their last bits |
 | `SMV_REST_FOLD=old` | The sub-pixel fold of Real-ESRGAN / AnimeJaNai (Restore and both upscalers) by the thread-an-output kernel (k_restFoldHSub, every tap reads its own pixel) instead of the shared-memory form (k_restFoldHSubT); A/B: the same frames |
+| `SMV_LZ_MATCHED=0` | Every enlarge at Lanczos radius 4, also after the session's own shrink (no solved table, no radius 8; the A/B of the enlarge after Live's capture shrink or a file render's decode-side shrink) |
+| `SMV_SHRINK_BICUBIC=0` | The shrink to the working size stays Lanczos at radius 7 in front of RTX VSR and Anime4K too (no bicubic shrink; its A/B, Live's capture shrink and a file render's decode-side shrink) |
 | `SMV_GM_SCRATCH=own` | GMFSS's pair scratch in its own buffers instead of carved from the splat accumulator (A/B; the same output) |
 | `SMV_GM_CTXSHARE=0` | each of GMFSS's nets on its own activation block instead of the one block they share (A/B) |
 | `SMV_FU_R4=0` | GMFSS's fusion net never runs a wide conv as its 4-row twin (A/B; the same output) |
@@ -2398,12 +2435,12 @@ loader + frame generation DLLs (`Kits/FidelityFX/signedbin`, unmodified) and vkd
 `engine/fsrfg` (committed and shipped; licences in THIRD_PARTY_NOTICES.md and `engine/fsrfg/licenses/`).
 
 vkd3d-proton first (MSYS2 UCRT64 with gcc, meson, ninja and glslang): clone
-github.com/HansKristian-Work/vkd3d-proton at 5b1089c89dbc5cb9f662650feb60d2d3df3e55ca with its submodules
-(dxil-spirv at 114e664efca411c926380b2f3bd1930c1faeaf4d), then
+github.com/HansKristian-Work/vkd3d-proton at bfdb811c6d7ccd8c6151f19532654b063a6631f2 with its submodules
+(dxil-spirv at a781dce9b5f2dd076f419d7f98dcc2dcf5f011d5), then
 
 ```
-git apply engine/fsrfg/source/vkd3d-proton-5b1089c-smv.patch        (in the vkd3d-proton checkout)
-git apply engine/fsrfg/source/dxil-spirv-114e664-smv.patch          (in subprojects/dxil-spirv)
+git apply engine/fsrfg/source/vkd3d-proton-bfdb811-smv.patch        (in the vkd3d-proton checkout)
+git apply engine/fsrfg/source/dxil-spirv-a781dce-smv.patch          (in subprojects/dxil-spirv)
 meson setup build --buildtype=release -Denable_extended_emulation=true
 ninja -C build
 ```

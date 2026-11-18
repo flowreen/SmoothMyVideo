@@ -27,20 +27,20 @@
 </p>
 
 <p align="center">
-  <img src="docs/demo-fight.webp" alt="Side by side: a fast 1080p anime fight and a backflip at their original 24 fps and interpolated to 60 fps" width="880"><br>
-  <sub><b>The same scene, before and after.</b> About 8 seconds from episode 1 of <a href="https://sh-anime.shochiku.co.jp/jukishi-anime/"><i>The Exiled Heavy Knight Knows How to Game the System</i></a>, downscaled. Left: the source frames at 24 fps, no interpolation. Right: Smooth My Video's 60 fps render with the default GMFSS model, drawing the frames in between through sparks, blades, camera moves and a backflip.</sub><br>
+  <img src="docs/demo-fight.webp" alt="Side by side: a fast 1080p anime fight and a backflip at their original 24 FPS and interpolated to 60 FPS" width="880"><br>
+  <sub><b>The same scene, before and after.</b> About 8 seconds from episode 1 of <a href="https://sh-anime.shochiku.co.jp/jukishi-anime/"><i>The Exiled Heavy Knight Knows How to Game the System</i></a>, downscaled. Left: the source frames at 24 FPS, no interpolation. Right: Smooth My Video's 60 FPS render with the default GMFSS model, drawing the frames in between through sparks, blades, camera moves and a backflip.</sub><br>
   <sub><i>&copy; Nekoko, BroccoLee, Jaian, KODANSHA/"The Exiled Heavy Knight Knows How to Game the System" Production Committee (&copy;猫子・武六甲理衣・じゃいあん・講談社／「追放された転生重騎士はゲーム知識で無双する」製作委員会)</i></sub>
 </p>
 
 <p align="center">
-  <img src="docs/demo-spiderman.webp" alt="Side by side: a fast live-action fight scene at its original 24 fps and interpolated to 60 fps" width="880"><br>
-  <sub><b>Live action, too.</b> 14 seconds from <a href="https://en.wikipedia.org/wiki/Spider-Man:_Brand_New_Day"><i>Spider-Man: Brand New Day</i></a> (2026), downscaled. Left: the source frames at 24 fps, no interpolation. Right: Smooth My Video's 60 fps render with the default GMFSS model, drawing the frames in between through motion blur, flying debris and web lines.</sub><br>
+  <img src="docs/demo-spiderman.webp" alt="Side by side: a fast live-action fight scene at its original 24 FPS and interpolated to 60 FPS" width="880"><br>
+  <sub><b>Live action, too.</b> 14 seconds from <a href="https://en.wikipedia.org/wiki/Spider-Man:_Brand_New_Day"><i>Spider-Man: Brand New Day</i></a> (2026), downscaled. Left: the source frames at 24 FPS, no interpolation. Right: Smooth My Video's 60 FPS render with the default GMFSS model, drawing the frames in between through motion blur, flying debris and web lines.</sub><br>
   <sub><i>&copy; 2026 Columbia Pictures (Sony Pictures) and Marvel Studios</i></sub>
 </p>
 
 <p align="center">
-  <img src="docs/demo-pan.webp" alt="Side by side: the same anime-style panning shot at 10 fps and interpolated to 60 fps" width="880"><br>
-  <sub><b>Slow pans, too.</b> Left: an anime-style pan at 10 fps (drawn procedurally for this README), the cadence anime pans are actually drawn at. Right: interpolated 6&times; to 60 fps. Every original frame passes through untouched; the AI draws only the frames in between.</sub>
+  <img src="docs/demo-pan.webp" alt="Side by side: the same anime-style panning shot at 10 FPS and interpolated to 60 FPS" width="880"><br>
+  <sub><b>Slow pans, too.</b> Left: an anime-style pan at 10 FPS (drawn procedurally for this README), the cadence anime pans are actually drawn at. Right: interpolated 6&times; to 60 FPS. Every original frame passes through untouched; the AI draws only the frames in between.</sub>
 </p>
 
 **Why it exists:** NVIDIA's RTX Video (AI upscaling + RTX HDR) is gorgeous but playback-only: it enhances what you
@@ -72,9 +72,9 @@ settings both share. The panels are numbered in the order the passes run.
   </tr>
 </table>
 
-**Speed** works in both modes: type a target fps, or pick **Screen refresh rate** to match your monitor. Video renders
+**Speed** works in both modes: type a target FPS, or pick **Screen refresh rate** to match your monitor. Video renders
 keep the exact rate (59.94 stays 59.94), up to 100&times; the source. A whole multiple of the source rate is
-"on-grid" (every original frame is kept), and the **&asymp;** button snaps to the nearest one. Live uses whole fps, up
+"on-grid" (every original frame is kept), and the **&asymp;** button snaps to the nearest one. Live uses whole FPS, up
 to 10000.
 
 ## Get started
@@ -115,7 +115,7 @@ picture, without adding frames. Hover a row in the app to see its exact version.
 
 | Model | Best for | Needs | Notes |
 |---|---|---|---|
-| **NVIDIA DLSS 4.5** (DLSS Frame Generation; default on RTX 40/50) | Most videos, high frame rates, Live | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | NVIDIA's game frame generation, on video, and the fastest model. Makes whole multiples of the source rate, and reaches other targets with evenly spaced frames of a higher multiple (24 to 60 fps = every 2nd frame of 5&times;). An RTX 50 makes up to 6&times; in one pass, an RTX 40 2&times;; higher multipliers take several passes. |
+| **NVIDIA DLSS 4.5** (DLSS Frame Generation; default on RTX 40/50) | Most videos, high frame rates, Live | RTX 40/50, a recent driver, Windows hardware-accelerated GPU scheduling | NVIDIA's game frame generation, on video, and the fastest model. Makes whole multiples of the source rate, and reaches other targets with evenly spaced frames of a higher multiple (24 to 60 FPS = every 2nd frame of 5&times;). An RTX 50 makes up to 6&times; in one pass, an RTX 40 2&times;; higher multipliers take several passes. |
 | **GMFSS** (default on other GPUs) | Anime | Any RTX GPU | The cleanest frames, even at high multipliers; the heaviest on the GPU. |
 | **RIFE** (Practical-RIFE 4.25) | Live action, filmed content | Any RTX GPU | A strong all-round model. Its **DRBA** option (for anime) keeps characters moving at their drawn pace while camera pans get fully smooth; in Live it adds one frame of delay. |
 | **NVIDIA Optical Flow** | Slower PCs, fast renders, moderate motion | Any RTX GPU | Runs on a dedicated part of the GPU, so it is fast. Very fast motion turns into a soft double image instead of breaking up. Videos need a whole multiplier (2&times;, 3&times; ...). |
@@ -175,7 +175,7 @@ In the preview, **Show changed pixels** turns the processed side into a heat map
 * 🗜️ **Visually lossless, 10-bit.** HEVC (default), AV1 or H.266 (VVC), at top quality with no knob to guess at.
   10-bit output keeps skies and glows free of banding.
 * 💬 **Keeps your tracks.** All audio, subtitles / translations and chapters are copied, and the output switches to
-  `.mkv` when MP4 cannot carry a track. Font attachments are kept in `.mkv` outputs. Above 1000 fps the output stays
+  `.mkv` when MP4 cannot carry a track. Font attachments are kept in `.mkv` outputs. Above 1000 FPS the output stays
   `.mp4` (MKV cannot time that many frames a second) and the subtitles are saved as separate files beside it, which
   players load by themselves.
 * 📱 **Handles real-world files.** Phone clips and screen recordings with a changing frame rate stay in sync, HDR
@@ -192,7 +192,7 @@ In the preview, **Show changed pixels** turns the processed side into a heat map
 * 🧺 **Set-and-forget batches.** Pick or drop several files: they render one after another with the same settings, a
   file that fails is noted and the rest keep going, and a batch interrupted by a crash or restart is queued again on
   the next launch.
-* 📊 **Always in view.** Frames, render fps, an ETA with the finish time and the projected file size (with a warning
+* 📊 **Always in view.** Frames, render FPS, an ETA with the finish time and the projected file size (with a warning
   when the drive is too small), a thumbnail of the frame being written, taskbar progress, and a notification when a
   render or batch finishes while the window is in the background. Your PC will not sleep mid-render.
 
@@ -202,7 +202,7 @@ In the preview, **Show changed pixels** turns the processed side into a heat map
 * **Before / after preview:** a still frame with your Restore, resize, DLSS 5, Sharpen and HDR settings over the
   original, with a divider you drag to compare the two. It updates as you change settings; step to a random frame,
   and click the picture for a 1:1 pixel view.
-* **Output name:** `<name>_<fps>fps` (the fps rounded, so 59.94 gives `_60fps`; plus `_<height>p` when resized) next
+* **Output name:** `<name>_<fps>fps` (the FPS rounded, so 59.94 gives `_60fps`; plus `_<height>p` when resized) next
   to the source, `.mp4` or `.mkv` as needed. With no model ticked it is `_<height>p`, or `_restored` / `_dlss5` /
   `_sharpened` / `_hdr` after the pass that runs. Edit the **Saves to** path in place or with **Change&hellip;**;
   clearing it brings the automatic name back. After a render, **Open folder** or **Play video**.
@@ -228,14 +228,14 @@ Real-time frame generation on any window: the Lossless-Scaling-style feature, bu
   works with every model including DLSS 4.5. **Original size** smooths only the window. **Fill screen** fills its
   monitor with the window (aspect kept), upscaled with RTX VSR, AMD FSR 4.1, Intel XeSS, Anime4K, ArtCNN,
   Real-ESRGAN or AnimeJaNai HD when ticked.
-* **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your fps target whatever the source does (a
-  game dropping from 30 to 10 fps still plays at the same smooth rate). AMD FSR 4, Intel XeSS-FG and Smooth Motion
-  double the frame rate per pass, so they pick the doubling that reaches your target (60 fps from 24 shows 96). DLSS 4.5 matches
+* **Adaptive:** with GMFSS, RIFE or NVIDIA Optical Flow the output holds your FPS target whatever the source does (a
+  game dropping from 30 to 10 FPS still plays at the same smooth rate). AMD FSR 4, Intel XeSS-FG and Smooth Motion
+  double the frame rate per pass, so they pick the doubling that reaches your target (60 FPS from 24 shows 96). DLSS 4.5 matches
   your target, your screen's refresh rate included: a whole multiple when one fits, else evenly spaced frames of a
-  higher one (60 fps from 24 = every 2nd frame of 5&times;).
+  higher one (60 FPS from 24 = every 2nd frame of 5&times;).
 * **Fit to the GPU** (on by default) lowers the frame rate to what your GPU can keep up with, never below the source,
   with every effect kept. Unticked, a target the GPU can't reach makes it skip frames.
-* **Readout:** a small green corner readout shows the source fps, the smoothed fps, and roughly how far the picture
+* **Readout:** a small green corner readout shows the source FPS, the smoothed FPS, and roughly how far the picture
   runs behind reality: about a source frame, made for watching, not for competitive play. **Show FPS meter** turns it
   off; **Show latency** hides its latency part.
 * **The first session at a new window size** takes a while to prepare (about 30 s for GMFSS, 45 s for RIFE, 55 s
@@ -338,3 +338,6 @@ only to show what Smooth My Video does. The footage belongs to its copyright hol
 not covered by this project's MIT license; Smooth My Video is not affiliated with or endorsed by them. Rights holders
 who want a clip removed can [open an issue](https://github.com/flowreen/SmoothMyVideo/issues) and it will be taken
 down promptly.</sub>
+
+<sub>Smooth My Video is released under the [MIT license](LICENSE). Third-party components are listed in
+[THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).</sub>

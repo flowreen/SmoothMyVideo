@@ -3,10 +3,10 @@ rem Builds engine\fsrfg: smv_fsrfg_bridge.dll (fsrfg_bridge.cpp) and amdxc64.dll
 rem them AMD's signed FSR SDK v2.4.0 loader + frame generation DLLs (signedbin, unmodified) and vkd3d-proton's two DLLs.
 rem
 rem vkd3d-proton (LGPL-2.1, built separately, MSYS2 UCRT64 with gcc, meson and ninja): github.com/HansKristian-Work/
-rem vkd3d-proton at commit 5b1089c89dbc5cb9f662650feb60d2d3df3e55ca with its submodules, dxil-spirv at
-rem 114e664efca411c926380b2f3bd1930c1faeaf4d, then
-rem   git apply ..\source\vkd3d-proton-5b1089c-smv.patch            (in the vkd3d-proton checkout)
-rem   git apply ..\source\dxil-spirv-114e664-smv.patch              (in subprojects\dxil-spirv)
+rem vkd3d-proton at commit bfdb811c6d7ccd8c6151f19532654b063a6631f2 with its submodules, dxil-spirv at
+rem a781dce9b5f2dd076f419d7f98dcc2dcf5f011d5, then
+rem   git apply ..\source\vkd3d-proton-bfdb811-smv.patch            (in the vkd3d-proton checkout)
+rem   git apply ..\source\dxil-spirv-a781dce-smv.patch              (in subprojects\dxil-spirv)
 rem   meson setup build --buildtype=release -Denable_extended_emulation=true
 rem   ninja -C build
 rem The patches: VKD3D_FP8_EMULATION=1 runs the FP8 cooperative matrices of AMD's ML shaders as FP16 ones, dxil-spirv's

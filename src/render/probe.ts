@@ -292,9 +292,16 @@ export function decodeRgbVf(st: Stream, w: number, h: number, fmt = planarRgb(st
 /** The -vf chain for a decode-side downscale of a w x h source to dw x dh: the decode's zimg conversion to float
  * planes, then zimg's Lanczos at radius 7 on the source's own codes (the host's shrink, kLzDown), rounded by zimg to
  * the pipe's integers (swscale's pack of float planes is 0.36 codes bright at 8 bits). In linear light, radius 3, 4
- * and 6 measured 1.5 to 1.7 dB under it through SMV's enlarge back. What zimg cannot read: swscale's Lanczos 7. */
-export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: number): string[] {
+ * and 6 measured 1.5 to 1.7 dB under it through SMV's enlarge back. What zimg cannot read: swscale's Lanczos 7.
+ * `bicubic` = the same chain with Catmull-Rom (the cubic at b 0, c 0.5, widened by the ratio as the Lanczos is)
+ * instead: the shrink in front of RTX VSR or Anime4K (plan.ts bicubicShrink). */
+export function dscaleVf(st: Stream, w: number, h: number, dw: number, dh: number, bicubic = false): string[] {
   const conv = decodeRgbVf(st, w, h, 'gbrpf32le');
-  if (!conv.length) return [`scale=${dw}:${dh}:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:param0=7`];
-  return conv.concat([`zscale=w=${dw}:h=${dh}:filter=lanczos:param_a=7:dither=none`, `format=${planarRgb(st)}`]);
+  if (!conv.length)
+    return [
+      `scale=${dw}:${dh}:flags=${bicubic ? 'bicubic' : 'lanczos'}+accurate_rnd+full_chroma_int+full_chroma_inp:` +
+        (bicubic ? 'param0=0:param1=0.5' : 'param0=7'),
+    ];
+  const filter = bicubic ? 'filter=bicubic:param_a=0:param_b=0.5' : 'filter=lanczos:param_a=7';
+  return conv.concat([`zscale=w=${dw}:h=${dh}:${filter}:dither=none`, `format=${planarRgb(st)}`]);
 }

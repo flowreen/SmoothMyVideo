@@ -47,7 +47,7 @@ __device__ __forceinline__ float h2f(unsigned short h)
 }
 
 // ---- every resize the host does itself (RTX VSR does the others): Lanczos -------------------
-// The radius a (the lobes) per axis: kLzUp on an axis that enlarges or keeps its size, kLzDown on
+// The radius a (the lobes) per axis: the session's c_lzUp on an axis that enlarges or keeps its size, kLzDown on
 // one that shrinks = the universal resizer test's picks, the best no-sharpen PSNR over anime, real
 // camera and CGI at every ratio (up) and working size (down). These defines are the one place they
 // are set: the cubin cache key hashes this text, the host reads them for the tap tables' sizes
@@ -58,6 +58,14 @@ __device__ __forceinline__ float h2f(unsigned short h)
 #ifndef kLzDown
 #define kLzDown 7
 #endif
+// The session's enlarge (nativeLzSession sets it before any table or resize): kLzUp, or kLzUpShrunk when the
+// session's frames come from its own shrink (Live's capture to the working size, a file render's decode-side
+// shrink). Then every enlarge reads 2 kLzUpShrunk taps: one back to the size the frames were shrunk from takes
+// weights solved to undo that shrink (the host's lzMatchedTab), any other Lanczos at kLzUpShrunk.
+#ifndef kLzUpShrunk
+#define kLzUpShrunk 8
+#endif
+__constant__ int c_lzUp = kLzUp;
 // sinc(x) sinc(x / a) for |x| < a, placed the way zimg places it: output index o of an in -> out
 // axis sits at (o + 0.5) in / out on the input grid, a shrinking axis widens the filter by in /
 // out (the antialiasing), the fs = 2 ceil(a max(in, out) / out) taps start at round_halfup(that
@@ -74,7 +82,7 @@ __device__ __forceinline__ float lanczosA(float x, int a)
 }
 __device__ __forceinline__ int rsTaps(int in, int out)
 {
-    return in > out ? 2 * (int)(((long long)kLzDown * in + out - 1) / out) : 2 * kLzUp;
+    return in > out ? 2 * (int)(((long long)kLzDown * in + out - 1) / out) : 2 * c_lzUp;
 }
 __device__ __forceinline__ int rsBegin(int o, int in, int out, int fs)
 {
@@ -92,7 +100,7 @@ __device__ __forceinline__ float rsArg(int j, int o, int in, int out)
 // the unnormalised weight of tap j for output index o, at the axis's radius
 __device__ __forceinline__ float rsW(int j, int o, int in, int out)
 {
-    return lanczosA(rsArg(j, o, in, out), in > out ? kLzDown : kLzUp);
+    return lanczosA(rsArg(j, o, in, out), in > out ? kLzDown : c_lzUp);
 }
 // a tap past an edge reads the mirrored pixel (half-sample symmetric), clamped for a window wider
 // than the axis
@@ -128,6 +136,35 @@ __global__ void k_rsTab(int in, int out, RsTap* __restrict__ tab)
     {
         RsTap t;
         t.w = __fmul_rn(rsW(mn + k, o, in, out), inv);
+        t.i = rsMirror(mn + k, in);
+        tab[(size_t)k * out + o] = t;
+    }
+}
+// Catmull-Rom (the cubic at b 0, c 0.5): the session's own shrink in front of RTX VSR or Anime4K (the host's
+// nativeShrinkBc), which rebuild a picture shrunk this way more closely than one the Lanczos shrank
+__device__ __forceinline__ float catmullRom(float x)
+{
+    x = fabsf(x);
+    if (x >= 2.0f) return 0.0f;
+    if (x < 1.0f) return (1.5f * x - 2.5f) * x * x + 1.0f;
+    return ((-0.5f * x + 2.5f) * x - 4.0f) * x + 2.0f;
+}
+// k_rsTab's table for that shrink (in > out): the same placement, window and layout, so every reader takes it as it
+// is; the kernel widened by in / out like the Lanczos, its reach of 2 in / out inside the Lanczos window, the taps
+// beyond it zeros
+__global__ void k_rsTabBc(int in, int out, RsTap* __restrict__ tab)
+{
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= out) return;
+    const int fs = rsTaps(in, out);
+    const int mn = rsBegin(o, in, out, fs);
+    float s = 0.0f;
+    for (int k = 0; k < fs; k++) s += catmullRom(rsArg(mn + k, o, in, out));
+    const float inv = 1.0f / s;
+    for (int k = 0; k < fs; k++)
+    {
+        RsTap t;
+        t.w = __fmul_rn(catmullRom(rsArg(mn + k, o, in, out)), inv);
         t.i = rsMirror(mn + k, in);
         tab[(size_t)k * out + o] = t;
     }
@@ -504,7 +541,7 @@ __global__ void k_padPlanar(const float* __restrict__ src, int ps, int rs, int w
 
 // ---- every planar resize: the Lanczos pair --------------------------------------------------
 // The resize as a separable pair (the placement at the top of this block, each axis's taps read
-// from its k_rsTab table): 2 kLzUp taps on an enlarging axis, 2 ceil(kLzDown in / out) on a
+// from its k_rsTab table): 2 c_lzUp taps on an enlarging axis, 2 ceil(kLzDown in / out) on a
 // shrinking one, a pixel reading the sum of its two axes' taps.
 
 // horizontal pass: the model pad cropped to (w, h) -> tmp (3, h, dw)
@@ -5359,10 +5396,13 @@ static int lzDefine(const char* name)
     const char* p = strstr(kNativeKernels, name);
     return p ? atoi(p + strlen(name)) : 0;
 }
-static const int kLzUp = lzDefine("#define kLzUp "), kLzDown = lzDefine("#define kLzDown ");
+static const int kLzUp = lzDefine("#define kLzUp "), kLzDown = lzDefine("#define kLzDown "),
+                 kLzUpShrunk = lzDefine("#define kLzUpShrunk ");
+// the session's enlarge radius = the kernel text's c_lzUp (nativeLzSession sets the two together)
+static int g_lzUp = kLzUp;
 static int lzTaps(long long in, long long out)
 {
-    return in > out ? 2 * (int)((kLzDown * in + out - 1) / out) : 2 * kLzUp;
+    return in > out ? 2 * (int)((kLzDown * in + out - 1) / out) : 2 * g_lzUp;
 }
 
 // ---- dynamically resolved entry points ----------------------------------------------------

@@ -435,8 +435,10 @@ static bool nativeGroup(NativeRife& nr, const std::vector<uint8_t>& msg)
                 if (view)
                     rsrc = nr.dRsView;
             }
-            const void* tabH = rsTabFor(nr, nr.cw, nr.w, st);
-            const void* tabV = rsTabFor(nr, nr.ch, nr.h, st);
+            // in front of RTX VSR or Anime4K a shrinking axis takes the bicubic table
+            const bool bc = nativeShrinkBc(nr);
+            const void* tabH = rsTabFor(nr, nr.cw, nr.w, st, bc);
+            const void* tabV = rsTabFor(nr, nr.ch, nr.h, st, bc);
             if (!tabH || !tabV)
             {
                 nr.die("resize tap tables failed");

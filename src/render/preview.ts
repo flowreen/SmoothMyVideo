@@ -18,7 +18,7 @@ import * as zlib from 'zlib';
 import { INFERNO } from './inferno';
 import { engineCacheDir } from './cache';
 import { dlssgLimit, dlssgPasses, engineDir, tool } from './native';
-import { workPlan } from './plan';
+import { bicubicShrink, workPlan } from './plan';
 import { decodeRgbVf, frameCount, probe, sourceBits, SWS_ACCURATE, vfrConform } from './probe';
 import { pyFixed, pyG } from './pyfmt';
 
@@ -58,7 +58,7 @@ export interface PreviewArgs {
   hdr_saturation: number;
   hdr_contrast: number;
   hdr_nits: number; // --hdr-nits: TrueHDR's peak, 0 = the host's own pick (the primary display's)
-  model_a: string | null; // --model-a: a compare's first model (the Video tab's pick)
+  model_a: string | null; // --model-a: the Video tab's model: a compare's first one; the preview's shrink follows it
   model_b: string | null; // --model-b: the model it is compared to
   multi: number; // --multi: the compare's multiplier (new frames per pair + 1)
   pairs: number; // --pairs: the compare's pairs from the frame on (Save clip)
@@ -222,7 +222,8 @@ export function parsePreviewArgv(argv: string[]): PreviewArgs {
     if (v !== null && !(v in MODEL_FLAGS))
       throw new Error(`argument ${k}: invalid choice: '${v}' (choose from ${Object.keys(MODEL_FLAGS).join(', ')})`);
   }
-  if ((a.model_a === null) !== (a.model_b === null)) throw new Error('a compare takes both --model-a and --model-b');
+  // --model-a alone = a preview for that model's render (its shrink); with --model-b = a compare
+  if (a.model_a === null && a.model_b !== null) throw new Error('a compare takes both --model-a and --model-b');
   if (!(a.multi >= 2 && a.multi <= 100))
     throw new Error(`argument --multi: invalid choice: ${a.multi} (choose from 2 to 100)`);
   if (!(a.pairs >= 1 && a.pairs <= 240))
@@ -653,7 +654,22 @@ async function setup(a: PreviewArgs, env: NodeJS.ProcessEnv) {
   const srcHdr = transfer === 'smpte2084' || transfer === 'arib-std-b67';
   let doHdr = a.rtx_hdr && !srcHdr;
   const up = a.upscale <= 0 ? 1.0 : clamp(a.upscale, 1.0 / 16, 16.0);
-  const plan = workPlan(pr.st, pr.w, pr.h, up, a.scale, !!a.dlssnr);
+  const rtxDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
+  const rtxFiles = ['rtxvideo_cuda.dll', 'nvngx_truehdr.dll'].every((d) => isFile(path.join(rtxDir, d)));
+  // the render's shrink: bicubic in front of RTX VSR or Anime4K (the upscaler passFlags picks), as the render plans it
+  // for the Video tab's model (model_a; a compare runs both its models on these frames)
+  const bicubicUp = bicubicShrink(
+    {
+      vsr: a.rtx_vsr && rtxFiles,
+      anime4k: a.anime4k && !(a.rtx_vsr && rtxFiles) && !a.fsr_upscale,
+      hdr: srcHdr || a.rtx_hdr,
+      restore: a.restore,
+      dlssnr: !!a.dlssnr,
+      dlssg: a.model_a === 'dlssg',
+    },
+    env,
+  );
+  const plan = workPlan(pr.st, pr.w, pr.h, up, a.scale, !!a.dlssnr, false, bicubicUp);
   if (typeof plan === 'string') throw new Error(plan);
   const W = plan.w,
     H = plan.h;
@@ -664,8 +680,7 @@ async function setup(a: PreviewArgs, env: NodeJS.ProcessEnv) {
   const DEC_FMT = bits === 16 ? 'rgb48le' : 'rgb24',
     bpp = bits === 16 ? 6 : 3;
   let needVsr = OW > W && OH > H && a.rtx_vsr;
-  const rtxDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
-  if ((needVsr || doHdr) && !['rtxvideo_cuda.dll', 'nvngx_truehdr.dll'].every((d) => isFile(path.join(rtxDir, d)))) {
+  if ((needVsr || doHdr) && !rtxFiles) {
     needVsr = false; // no RTX Video bridge means Lanczos3 + SDR
     doHdr = false;
   }
@@ -724,6 +739,7 @@ async function setup(a: PreviewArgs, env: NodeJS.ProcessEnv) {
     doHdr,
     up,
     fold: plan.vf,
+    bicubic: plan.bicubic,
     W,
     H,
     OW,
@@ -751,6 +767,10 @@ function passFlags(
   const args: string[] = [];
   if (o.outW !== s.W || o.outH !== s.H) {
     args.push('--out-w', String(o.outW), '--out-h', String(o.outH));
+    // the decode's Lanczos shrink of the source: the host's enlarge back undoes it (a bicubic one goes back through
+    // its upscaler)
+    if (s.fold.length && !s.bicubic && (o.outW > s.W || o.outH > s.H))
+      args.push('--shrunk-from-w', String(s.pr.w), '--shrunk-from-h', String(s.pr.h));
     if (o.upscaler) {
       if (s.needVsr) args.push('--rtx-vsr', ...vsrQuality(a));
       else if (a.fsr_upscale && o.outW > s.W && o.outH > s.H) args.push('--fsr-upscale');
@@ -1071,6 +1091,7 @@ export async function compare(a: PreviewArgs, env: NodeJS.ProcessEnv = process.e
       const st = [...head(WW, WH, passes[i], frames, 'rgb48le', last ? outFmt : 'rgb48le'), '--dlssg'];
       if (last && lastResize) {
         st.push('--out-w', String(OW), '--out-h', String(OH));
+        if (s.fold.length && !s.bicubic) st.push('--shrunk-from-w', String(s.pr.w), '--shrunk-from-h', String(s.pr.h));
         if (s.needVsr) st.push('--rtx-vsr', ...vsrQuality(a));
         else if (a.fsr_upscale && OW > WW && OH > WH) st.push('--fsr-upscale');
         else if (a.anime4k && OW > WW && OH > WH) st.push('--anime4k', ...(a.anime4k_aa ? ['--anime4k-aa'] : []));
@@ -1118,7 +1139,7 @@ if (require.main === module) {
     process.stderr.write(`preview: error: ${(e as Error).message}\n`);
     process.exit(2);
   }
-  (a.model_a !== null ? compare(a) : preview(a)).then(
+  (a.model_b !== null ? compare(a) : preview(a)).then(
     (line) => {
       process.stdout.write(line);
     },

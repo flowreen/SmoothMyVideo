@@ -28,7 +28,7 @@ import {
   Say,
   saveSubsBeside,
 } from './encode';
-import { isGmfss, nvofRefusal, RenderArgs, workPlan } from './plan';
+import { bicubicShrink, isGmfss, nvofRefusal, RenderArgs, workPlan } from './plan';
 import { thumbPng } from './preview';
 import {
   decodeRgbVf,
@@ -563,9 +563,27 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
                   : DLSSG_MODE
                     ? 'dlssg'
                     : 'rife';
+  // the decode's shrink is bicubic in front of RTX VSR (its files present, else the host enlarges with Lanczos) or
+  // Anime4K, on an SDR chain without Restore, DLSS 5 or DLSS 4.5
+  const vsrDir = env.SMV_RTXVIDEO_DIR || path.join(ENGINE, 'rtxvideo');
+  const BICUBIC_UP = bicubicShrink(
+    {
+      vsr: RTX_VSR && ['rtxvideo_cuda.dll', 'nvngx_vsr.dll'].every((f) => isFile(path.join(vsrDir, f))),
+      anime4k: A4K_UP,
+      hdr: RTX_HDR || ['smpte2084', 'arib-std-b67'].includes(String(tag(ST, 'color_transfer') || '')),
+      restore: args.restore,
+      dlssnr: !!args.dlssnr,
+      dlssg: kind === 'dlssg',
+    },
+    env,
+  );
   // W x H = the decode, WORK = the DLSS mode x the output (DLSS 5 and the model)
-  const plan = workPlan(ST, W, H, UPSCALE_F, args.work_scale, !!args.dlssnr, kind === 'dlssg');
+  const plan = workPlan(ST, W, H, UPSCALE_F, args.work_scale, !!args.dlssnr, kind === 'dlssg', BICUBIC_UP);
   if (typeof plan === 'string') throw new RenderExit(plan);
+  // the decode's Lanczos shrink (a working size below the source): the host's enlarge back undoes it. A bicubic
+  // shrink is not named: its way back is the upscaler, and the solved enlarge fits the Lanczos shrink only
+  const SHRUNK_FROM =
+    plan.vf.length && !plan.bicubic ? ['--shrunk-from-w', String(W), '--shrunk-from-h', String(H)] : [];
   [W, H] = [plan.w, plan.h];
   const [WORK_W, WORK_H] = [plan.workW, plan.workH];
   UPSCALE = plan.outW !== W || plan.outH !== H;
@@ -964,6 +982,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
   const [P1_W, P1_H] = CASCADE ? [WORK_W, WORK_H] : [OUT_W, OUT_H];
   if (P1_W !== W || P1_H !== H) {
     nargs.push('--out-w', String(P1_W), '--out-h', String(P1_H));
+    if (P1_W > W || P1_H > H) nargs.push(...SHRUNK_FROM);
     if (!CASCADE || !lastResize) {
       if (RTX_VSR) nargs.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) nargs.push('--fsr-upscale');
@@ -1086,7 +1105,7 @@ async function nativeRoute(argv: string[], say: Say, env: NodeJS.ProcessEnv): Pr
     ];
     if (last && HOST_KEEP) a.push('--keep', String(DG_KEEP));
     if (last && lastResize) {
-      a.push('--out-w', String(OUT_W), '--out-h', String(OUT_H));
+      a.push('--out-w', String(OUT_W), '--out-h', String(OUT_H), ...SHRUNK_FROM);
       if (RTX_VSR) a.push('--rtx-vsr', ...VSR_Q);
       if (FSR_UP) a.push('--fsr-upscale');
       if (A4K_UP) a.push('--anime4k');

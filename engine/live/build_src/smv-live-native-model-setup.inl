@@ -66,6 +66,10 @@ static bool nativeCudaInitEarly(NativeRife& nr, const std::wstring& cacheDir)
 {
     if (!nativeBuildKernels(nr, cacheDir))
         return false;
+    // live: the frames come from the capture's shrink when the working size is below it (k_resizeH / V), and the fit
+    // after the model enlarges them back
+    if (!g_offline && !nativeLzSession(nr, nr.cw, nr.ch, nr.w, nr.h))
+        return false;
     // live: GMFSS and Restore read the HDR desktop's PQ planes as SDR sRGB over its SDR white, decided before
     // the engines and the RTX Video setup (a helper thread) size their buffers; offline sets it from the source
     if (!g_offline)

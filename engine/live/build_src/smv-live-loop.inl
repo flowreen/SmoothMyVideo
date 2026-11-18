@@ -1213,13 +1213,13 @@ struct Hud
         if (wcscmp(inTxt, L"0"))
             swprintf_s(mul, L" (%.2f\u00D7)", outFps / inFps);
         if (sourceOnly && latMs > 0.5 && !g_noHudLat)
-            swprintf_s(text, L"%ls fps   ~%.0f ms behind", inTxt, latMs);
+            swprintf_s(text, L"%ls FPS   ~%.0f ms behind", inTxt, latMs);
         else if (sourceOnly)
-            swprintf_s(text, L"%ls fps", inTxt);
+            swprintf_s(text, L"%ls FPS", inTxt);
         else if (latMs > 0.5 && !g_noHudLat)
-            swprintf_s(text, L"%ls fps \u2192 %.0f fps%ls   ~%.0f ms behind", inTxt, outFps, mul, latMs);
+            swprintf_s(text, L"%ls FPS \u2192 %.0f FPS%ls   ~%.0f ms behind", inTxt, outFps, mul, latMs);
         else
-            swprintf_s(text, L"%ls fps \u2192 %.0f fps%ls", inTxt, outFps, mul);
+            swprintf_s(text, L"%ls FPS \u2192 %.0f FPS%ls", inTxt, outFps, mul);
         if (!readoutLogged)
         {
             LOG("HUD readout: %s (%s)\n", wideToUtf8(text).c_str(),
@@ -2459,11 +2459,12 @@ static int runLive(const wchar_t* needle, HWND targetOverride, int genFrames, bo
 
         PipeServer srv;
         // the final enlarge's tap tables: the native k_rsTab once the native pipeline is up (SMV_DLSSG_LZ_TAB=cpu =
-        // the CPU port, the A/B of the two)
+        // the CPU port, the A/B of the two), the matched table after the capture's shrink either way
         if (host.lzOn)
             host.lzTabFn = [&srv, cpu = lkEnv("SMV_DLSSG_LZ_TAB") == "cpu"](int in, int out,
                                                                             std::vector<uint8_t>& tab) {
-                return nativeRsTabHost(cpu ? nullptr : srv.nr, in, out, tab);
+                const bool matched = srv.nr && lzMatched(*srv.nr, in, out);
+                return nativeRsTabHost(cpu && !matched ? nullptr : srv.nr, in, out, tab);
             };
         double srcMeasFps = 0; // the source rate measured before the server spawns (0 = not measured)
         if (g_backend == BK_SERVER)

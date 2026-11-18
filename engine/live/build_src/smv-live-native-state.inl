@@ -777,14 +777,19 @@ struct NativeRife
     uint8_t* dCap = nullptr;
     float* dTmp = nullptr; // the capture resize's horizontal pass, and nativeFitPlanar's (tmpN floats)
     size_t tmpN = 0;
-    // the Lanczos tap tables, one per resize axis in -> out (rsTabFor), freed by nativeFree
+    // the tap tables, one per resize axis in -> out and kernel (rsTabFor; bc = the bicubic shrink's, else the
+    // Lanczos or the solved enlarge), freed by nativeFree
     struct RsTab
     {
         int in, out;
         void* d;
+        bool bc;
     };
     std::vector<RsTab> rsTabs;
-    std::vector<RsTab> puRsTabs;  // the same for the upscaler after Live DLSS 4.5 (the present thread, its stream)
+    std::vector<RsTab> puRsTabs; // the same for the upscaler after Live DLSS 4.5 (the present thread, its stream)
+    // the session's own shrink per axis, {from, to} ({0, 0} = that axis was not shrunk; nativeLzSession): an enlarge
+    // from `to` back to `from` takes the matched table (lzMatchedTab)
+    int lzShrunk[2][2] = {{0, 0}, {0, 0}};
     float* dCapF = nullptr;       // HDR + image scale under 1: planar PQ at capture resolution
     uint8_t* dThdrIn = nullptr;   // RGBA8 bridge input, pitch 4*cw
     uint32_t* dThdrOut = nullptr; // packed 10:10:10:2 bridge output, B in the low bits
@@ -1033,6 +1038,7 @@ struct NativeRife
         fPackBgra = nullptr, fUnpackRgba = nullptr, fPackR10 = nullptr, // offline DLSS 4.5 frames, RTX VSR
         fUnpackR10 = nullptr;
     CUfunction fFitAaH = nullptr, fFitAaV = nullptr, fRsTab = nullptr;           // the separable fit, its tap tables
+    CUfunction fRsTabBc = nullptr;                                               // the bicubic shrink's tap table
     CUfunction fFsrHdrIn = nullptr, fFsrHdrOut = nullptr, fFsrHdrPack = nullptr; // AMD FSR upscaling on HDR planes
     CUfunction fPackOutV = nullptr, fPackOutHdrV = nullptr;                      // its vertical pass + the slot store
     CUfunction fRestIn = nullptr, fRestFoldH = nullptr, fRestFoldV = nullptr,    // live Restore
